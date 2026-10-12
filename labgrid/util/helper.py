@@ -1,5 +1,4 @@
 import errno
-import fcntl
 import logging
 import os
 import pty
@@ -8,6 +7,12 @@ import select
 import subprocess
 from contextlib import closing
 from socket import AF_INET, SOCK_STREAM, socket
+
+try:
+    import fcntl
+except ImportError:
+    # fcntl is not available, e. g. on Microsoft Windows
+    fcntl = None
 
 import attr
 
@@ -32,8 +37,12 @@ def get_user():
     return pwd.getpwuid(os.getuid())[0]
 
 def set_nonblocking(fd):
-    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    if fcntl is not None:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    else:
+        # This shouldn't even show up on Microsoft Windows later, as we can't use pty.openpty anyways...
+        logging.warning("Can't make socket non-blocking on this system due to missing fcntl!")
 
 @attr.s
 class ProcessWrapper:

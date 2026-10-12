@@ -1,8 +1,13 @@
-import fcntl
 import os
 import select
 import shlex
 import subprocess
+
+try:
+    import fcntl
+except ImportError:
+    # fcntl is not available, e. g. on Microsoft Windows
+    fcntl = None
 
 import attr
 
@@ -39,9 +44,12 @@ class ExternalConsoleDriver(ConsoleExpectMixin, Driver, ConsoleProtocol):
         )
 
         # make stdout non-blocking
-        stdout_fd = self._child.stdout.fileno()
-        stdout_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL) | os.O_NONBLOCK
-        fcntl.fcntl(stdout_fd, fcntl.F_SETFL, stdout_fl)
+        if fcntl is not None:
+            stdout_fd = self._child.stdout.fileno()
+            stdout_fl = fcntl.fcntl(stdout_fd, fcntl.F_GETFL) | os.O_NONBLOCK
+            fcntl.fcntl(stdout_fd, fcntl.F_SETFL, stdout_fl)
+        else:
+            self.logger.warning("Can't make STDOUT non-blocking on this system due to missing fcntl!")
 
         # prepare for timeout handing
         self._poll = select.poll()
