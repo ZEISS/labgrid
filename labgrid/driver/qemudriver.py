@@ -1,6 +1,5 @@
 """The QEMUDriver implements a driver to use a QEMU target"""
 import os
-import pty
 import select
 import shlex
 import shutil
@@ -9,6 +8,11 @@ import subprocess
 import re
 import tempfile
 import time
+
+try:
+    import pty
+except ImportError:
+    pty = None
 
 import attr
 from pexpect import TIMEOUT
@@ -379,6 +383,8 @@ class QEMUDriver(ConsoleExpectMixin, Driver, PowerProtocol, ConsoleProtocol):
         microcom_bin = shutil.which("microcom")
         if microcom_bin is None:
             raise ExecutionError("microcom not found")
+        if pty is None:
+            raise NotImplementedError("This system doesn't support pty, can't start minicom")
 
         # connect microcom to PTY
         master, slave = pty.openpty()

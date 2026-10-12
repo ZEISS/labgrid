@@ -1,9 +1,15 @@
 import string
 
-import pexpect
+try:
+    from pexpect import spawn as pexpect_spawn
+except ImportError:
+    # pexpect.spawn is not available, e. g. on Microsoft Windows
+    class pexpect_spawn:
+        def __init__(self, *args, **kwargs):
+            raise NotImplementedError("PtxExpect can't be used on windows due to missing pexpect.spawn")
 
 
-class PtxExpect(pexpect.spawn):
+class PtxExpect(pexpect_spawn):
     """labgrid Wrapper of the pexpect module.
 
     This class provides pexpect functionality for the ConsoleProtocol classes.

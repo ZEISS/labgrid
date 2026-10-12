@@ -1,7 +1,6 @@
 import errno
 import logging
 import os
-import pty
 import re
 import select
 import subprocess
@@ -13,6 +12,13 @@ try:
 except ImportError:
     # fcntl is not available, e. g. on Microsoft Windows
     fcntl = None
+
+try:
+    import pty
+except ImportError:
+    # pty is not available, presumably as we're on Microsoft Windows
+    pty = None
+    import winpty
 
 import attr
 
@@ -59,6 +65,11 @@ class ProcessWrapper:
             raise NotImplementedError(f"{stderr=} not supported")
 
         logger = logging.getLogger("Process")
+
+        if pty is None:
+            return self._check_output_winpty(
+                command, logger, print_on_silent_log, input, stdin)
+
         res = []
         mfd, sfd = pty.openpty()
         set_nonblocking(mfd)
@@ -177,6 +188,59 @@ class ProcessWrapper:
         # this converts '\r\n' to '\n' to be more compatible to the behaviour
         # of the normal subprocess module
         return b'\n'.join([r.strip(b'\n') for r in res])
+
+    def _check_output_winpty(self, command, logger, print_on_silent_log, input, stdin):
+        terminal = winpty.PTY(80, 40)
+        cmdline = subprocess.list2cmdline(command[1:])
+        terminal.spawn(command[0], cmdline=cmdline)
+        logger.log(ProcessWrapper.loglevel, "[%d] command: %s", terminal.pid, " ".join(command))
+
+        if ProcessWrapper.print_callback in self.callbacks:
+            print_on_silent_log = False
+        if print_on_silent_log and logger.getEffectiveLevel() > ProcessWrapper.loglevel:
+            self.enable_print()
+
+        class ProcessInfo:
+            pid = terminal.pid
+
+        process = ProcessInfo()
+        result = []
+        buf = b""
+        pending_input = input.decode("utf-8", errors="replace") if input else ""
+
+        while terminal.isalive():
+            if pending_input:
+                written = terminal.write(pending_input)
+                pending_input = pending_input[written:]
+            raw = terminal.read(blocking=False)
+            if raw:
+                data = raw.encode("utf-8", errors="replace")
+                *parts, buf = (buf + data).split(b"\r")
+                result.extend(parts)
+                for part in parts:
+                    for callback in self.callbacks:
+                        callback(part, process)
+            else:
+                time.sleep(0.01)
+
+        raw = terminal.read(blocking=False)
+        if raw:
+            *parts, buf = (buf + raw.encode("utf-8", errors="replace")).split(b"\r")
+            result.extend(parts)
+        status = terminal.get_exitstatus()
+        process.returncode = status
+        if buf:
+            result.append(buf)
+            final = buf if buf.endswith(b"\n") else buf + b"\n"
+            for callback in self.callbacks:
+                callback(final, process)
+        if print_on_silent_log and logger.getEffectiveLevel() > ProcessWrapper.loglevel:
+            self.disable_print()
+
+        result = b"\n".join(line.strip(b"\n") for line in result)
+        if status != 0:
+            raise subprocess.CalledProcessError(status, command, output=result)
+        return result
 
     def register(self, callback):
         """Register a callback with the ProcessWrapper"""
