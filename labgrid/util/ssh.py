@@ -15,6 +15,8 @@ from .helper import get_free_port, processwrapper
 
 __all__ = ['sshmanager', 'SSHConnection', 'ForwardError']
 
+_use_multiplexing = os.name != "nt"
+
 def get_ssh_connect_timeout():
     return int(os.environ.get("LG_SSH_CONNECT_TIMEOUT", 30))
 
@@ -140,6 +142,7 @@ class SSHConnection:
     )
     _l_forwards = attr.ib(init=False, default=attr.Factory(dict))
     _r_forwards = attr.ib(init=False, default=attr.Factory(set))
+    _forward_processes = attr.ib(init=False, default=attr.Factory(dict))
 
     def __attrs_post_init__(self):
         self._logger = logging.getLogger(f"{self}")
@@ -168,7 +171,9 @@ class SSHConnection:
     def _open_connection(self):
         """Internal function which appends the control socket and checks if the
         connection is already open"""
-        if self._check_external_master():
+        if not _use_multiplexing:
+            self._logger.info("SSH multiplexing is disabled")
+        elif self._check_external_master():
             self._logger.info("Using existing SSH connection to %s", self.host)
         else:
             self._start_own_master()
@@ -344,11 +349,11 @@ class SSHConnection:
 
         if destination in self._l_forwards:
             return self._l_forwards[destination]
-        self._run_socket_command(
-            "forward", [
-                f"-L{local_port}:{destination}"
-            ]
-        )
+        forward = f"-L{local_port}:{destination}"
+        if _use_multiplexing:
+            self._run_socket_command("forward", [forward])
+        else:
+            self._start_forward_process(forward)
         self._l_forwards[destination] = local_port
         return local_port
 
@@ -361,11 +366,11 @@ class SSHConnection:
         if local_port is None:
             raise ForwardError("Forward does not exist")
 
-        self._run_socket_command(
-            "cancel", [
-                f"-L{local_port}:{destination}"
-            ]
-        )
+        forward = f"-L{local_port}:{destination}"
+        if _use_multiplexing:
+            self._run_socket_command("cancel", [forward])
+        else:
+            self._stop_forward_process(forward)
 
     @_check_connected
     def add_remote_port_forward(self, remote_port, local_port, remote_bind=None):
@@ -381,7 +386,10 @@ class SSHConnection:
 
         forward = f"-R{remote_bind}:{remote_port:d}:localhost:{local_port:d}"
 
-        self._run_socket_command("forward", [forward])
+        if _use_multiplexing:
+            self._run_socket_command("forward", [forward])
+        else:
+            self._start_forward_process(forward)
         self._r_forwards.add(forward)
 
     @_check_connected
@@ -393,7 +401,23 @@ class SSHConnection:
         forward = f"-R{remote_bind}:{remote_port:d}:localhost:{local_port:d}"
 
         self._r_forwards.remove(forward)
-        self._run_socket_command("cancel", [forward])
+        if _use_multiplexing:
+            self._run_socket_command("cancel", [forward])
+        else:
+            self._stop_forward_process(forward)
+
+    def _start_forward_process(self, forward):
+        args = ["ssh"] + self._get_ssh_base_args() + ["-N", forward]
+        args.append(self.host)
+        self._forward_processes[forward] = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _stop_forward_process(self, forward):
+        process = self._forward_processes.pop(forward)
+        process.terminate()
+        process.wait()
 
     def connect(self):
         if not self._connected:
@@ -523,7 +547,7 @@ class SSHConnection:
         try:
             self._stop_keepalive()
 
-            if self._socket:
+            if _use_multiplexing and self._socket:
                 self._logger.info("Closing SSH connection to %s", self.host)
                 self._stop_own_master()
         finally:
@@ -533,11 +557,18 @@ class SSHConnection:
         if self.isconnected():
             # cancel local forwards
             for destination, local_port in self._l_forwards.items():
-                self._run_socket_command("cancel", [f"-L{local_port}:{destination}"])
+                forward = f"-L{local_port}:{destination}"
+                if _use_multiplexing:
+                    self._run_socket_command("cancel", [forward])
+                else:
+                    self._stop_forward_process(forward)
             self._l_forwards.clear()
             # cancel remote forwards
             for forward in self._r_forwards:
-                self._run_socket_command("cancel", [forward])
+                if _use_multiplexing:
+                    self._run_socket_command("cancel", [forward])
+                else:
+                    self._stop_forward_process(forward)
             self._r_forwards.clear()
             self.disconnect()
         shutil.rmtree(self._tmpdir)

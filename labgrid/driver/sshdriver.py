@@ -23,6 +23,8 @@ from ..util.proxy import proxymanager
 from ..util.timeout import Timeout
 from ..util.ssh import get_ssh_connect_timeout
 
+_use_multiplexing = os.name != "nt"
+
 
 @target_factory.reg_driver
 @attr.s(eq=False)
@@ -71,7 +73,7 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
         if self._get_password() is None:
             self.ssh_prefix += ["-o", "PasswordAuthentication=no"]
 
-        self.control = self._start_own_master()
+        self.control = self._start_own_master() if _use_multiplexing else None
         self.ssh_prefix += ["-F", "none"]
         if self.control:
             self.ssh_prefix += ["-o", f"ControlPath={self.control.replace('%', '%%')}"]
@@ -83,7 +85,8 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
         try:
             self._stop_keepalive()
         finally:
-            self._cleanup_own_master()
+            if _use_multiplexing:
+                self._cleanup_own_master()
 
     @property
     def skip_deactivate_on_export(self):
@@ -92,6 +95,9 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
 
     def _start_own_master(self):
         """Starts a controlmaster connection in a temporary directory."""
+
+        if not _use_multiplexing:
+            raise Exception("Tried to start master, but ssh multiplexing is not enabled on this system")
 
         timeout = Timeout(self.connection_timeout)
 
@@ -262,6 +268,18 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
 
     @contextlib.contextmanager
     def _forward(self, forward):
+        if not _use_multiplexing:
+            cmd = [self._ssh, *self.ssh_prefix, "-N", forward,
+                   "-p", str(self.networkservice.port), "-l", self._get_username(),
+                   self.networkservice.address]
+            self.logger.debug("Running command: %s", cmd)
+            tunnel = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            try:
+                yield
+            finally:
+                tunnel.terminate()
+                tunnel.wait()
+            return
         cmd = [self._ssh, *self.ssh_prefix,
                "-O", "forward", forward,
                self.networkservice.address
@@ -374,10 +392,12 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
         complete_cmd = [self._scp,
                 "-S", self._ssh,
                 "-F", "none",
-                "-o", f"ControlPath={self.control.replace('%', '%%')}",
                 src, dst,
         ]
-        
+        if self.control:
+            complete_cmd.insert(1, "-o")
+            complete_cmd.insert(2, f"ControlPath={self.control.replace('%', '%%')}")
+
         if self.explicit_sftp_mode and self._scp_supports_explicit_sftp_mode():
             complete_cmd.insert(1, "-s")
         if self.explicit_scp_mode and self._scp_supports_explicit_scp_mode():
@@ -404,8 +424,9 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
 
         ssh_cmd = [self._ssh,
                 "-F", "none",
-                "-o", f"ControlPath={self.control.replace('%', '%%')}",
         ]
+        if self.control:
+            ssh_cmd += ["-o", f"ControlPath={self.control.replace('%', '%%')}"]
 
         complete_cmd = [self._rsync,
                 "-v",
@@ -431,10 +452,12 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
         complete_cmd = [self._sshfs,
                 "-F", "none",
                 "-f",
-                "-o", f"ControlPath={self.control.replace('%', '%%')}",
                 f":{path}",
                 mountpoint,
         ]
+        if self.control:
+            complete_cmd.insert(1, "-o")
+            complete_cmd.insert(2, f"ControlPath={self.control.replace('%', '%%')}")
 
         self.logger.debug("Running command: %s", complete_cmd)
         sub = subprocess.Popen(
