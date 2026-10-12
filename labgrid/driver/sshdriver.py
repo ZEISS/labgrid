@@ -74,7 +74,6 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
             self.ssh_prefix += ["-o", "PasswordAuthentication=no"]
 
         self.control = self._start_own_master() if _use_multiplexing else None
-        self.ssh_prefix += ["-F", "none"]
         if self.control:
             self.ssh_prefix += ["-o", f"ControlPath={self.control.replace('%', '%%')}"]
 
@@ -391,7 +390,6 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
 
         complete_cmd = [self._scp,
                 "-S", self._ssh,
-                "-F", "none",
                 src, dst,
         ]
         if self.control:
@@ -422,9 +420,7 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
         if dst.startswith(':'):
             dst = '_' + dst
 
-        ssh_cmd = [self._ssh,
-                "-F", "none",
-        ]
+        ssh_cmd = [self._ssh]
         if self.control:
             ssh_cmd += ["-o", f"ControlPath={self.control.replace('%', '%%')}"]
 
@@ -450,7 +446,6 @@ class SSHDriver(CommandMixin, Driver, CommandProtocol, FileTransferProtocol):
             raise ExecutionError("Keepalive no longer running")
 
         complete_cmd = [self._sshfs,
-                "-F", "none",
                 "-f",
                 f":{path}",
                 mountpoint,
