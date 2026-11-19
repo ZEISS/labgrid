@@ -99,6 +99,10 @@ class ManagedFile:
 
         self._on_nfs_cached = False
 
+        if os.name == "nt":
+            self.logger.debug("Skipping NFS detection for a Windows client path")
+            return False
+
         fmt = "inode=%i,size=%s,modified=%Y"
         # The stat command is very different on MacOs
         platform = import_module('platform')

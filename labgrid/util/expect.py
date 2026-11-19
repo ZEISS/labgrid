@@ -1,15 +1,9 @@
 import string
 
-try:
-    from pexpect import spawn as pexpect_spawn
-except ImportError:
-    # pexpect.spawn is not available, e. g. on Microsoft Windows
-    class pexpect_spawn:
-        def __init__(self, *args, **kwargs):
-            raise NotImplementedError("PtxExpect can't be used on windows due to missing pexpect.spawn")
+from pexpect.spawnbase import SpawnBase
 
 
-class PtxExpect(pexpect_spawn):
+class PtxExpect(SpawnBase):
     """labgrid Wrapper of the pexpect module.
 
     This class provides pexpect functionality for the ConsoleProtocol classes.
@@ -19,7 +13,7 @@ class PtxExpect(pexpect_spawn):
     def __init__(self, driver, linesep=b"\n"):
         "Initializes a pexpect spawn instance with the required configuration"
         self.driver = driver
-        pexpect.spawn.__init__(self, None, maxread=1)
+        super().__init__(maxread=1)
         # the linesep needs to be set *after* pexpect is initialized, otherwise it would be overwritten
         self.linesep = linesep
 
@@ -30,6 +24,9 @@ class PtxExpect(pexpect_spawn):
 
         b = s
         return self.driver.write(b)
+
+    def sendline(self, s=b""):
+        return self.send(self._coerce_send_string(s) + self.linesep)
 
     def sendcontrol(self, char):
         """Send control character to underlying transport, e.g. Ctrl-C or Ctrl-Z."""

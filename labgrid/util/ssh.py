@@ -4,6 +4,8 @@ import logging
 import shutil
 import subprocess
 import os
+import socket
+import time
 from select import select
 from functools import wraps
 from typing import Dict
@@ -246,6 +248,16 @@ class SSHConnection:
                 f"error executing command: {complete_cmd}"
             )
 
+        if os.name == "nt":
+            out, err = sub.communicate()
+            stdout = out.decode(codec, decodeerrors).splitlines()
+            stderr = err.decode(codec, decodeerrors).splitlines() if err is not None else []
+            for lines, loglevel in ((stdout, stdout_loglevel), (stderr, stderr_loglevel)):
+                if loglevel is not None:
+                    for line in lines:
+                        self._logger.log(loglevel, line)
+            return stdout, stderr, sub.returncode
+
         stdout = []
         stderr = []
 
@@ -327,8 +339,14 @@ class SSHConnection:
     @_check_connected
     def put_file(self, local_file, remote_path):
         """Put a file onto the remote host"""
-        complete_cmd = ["rsync", "--compress", "--sparse", "--copy-links", "--verbose", "--progress", "--times", "-e",
-                        " ".join(['ssh'] + self._get_ssh_args())]
+        if os.name == "nt":
+            complete_cmd = ["scp", "-C", "-p"] + [
+                arg for arg in self._get_ssh_args() if arg != "-x"
+            ]
+            local_file = os.path.abspath(local_file)
+        else:
+            complete_cmd = ["rsync", "--compress", "--sparse", "--copy-links", "--verbose", "--progress", "--times", "-e",
+                            " ".join(['ssh'] + self._get_ssh_args())]
         complete_cmd += [
             f"{local_file}",
             f"{self.host}:{remote_path}"
@@ -407,17 +425,42 @@ class SSHConnection:
             self._stop_forward_process(forward)
 
     def _start_forward_process(self, forward):
-        args = ["ssh"] + self._get_ssh_base_args() + ["-N", forward]
+        args = ["ssh"] + self._get_ssh_base_args() + [
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", f"ConnectTimeout={get_ssh_connect_timeout()}", "-N", forward,
+        ]
         args.append(self.host)
-        self._forward_processes[forward] = subprocess.Popen(
+        process = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
         )
+        try:
+            if forward.startswith("-L"):
+                port = int(forward[2:].split(":", 1)[0])
+                deadline = time.monotonic() + get_ssh_connect_timeout()
+                while True:
+                    if process.poll() is not None:
+                        raise ForwardError(f"SSH forwarding exited with status {process.returncode}")
+                    try:
+                        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                            break
+                    except (ConnectionRefusedError, socket.timeout):
+                        if time.monotonic() >= deadline:
+                            raise ForwardError(f"SSH forwarding did not become ready: {forward}")
+                        time.sleep(0.05)
+            self._forward_processes[forward] = process
+        finally:
+            if forward not in self._forward_processes:
+                process.terminate()
+                process.wait(timeout=10)
 
     def _stop_forward_process(self, forward):
         process = self._forward_processes.pop(forward)
         process.terminate()
-        process.wait()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
 
     def connect(self):
         if not self._connected:
@@ -545,6 +588,11 @@ class SSHConnection:
     def disconnect(self):
         assert self._connected
         try:
+            for forward in tuple(self._forward_processes):
+                self._stop_forward_process(forward)
+            if not _use_multiplexing:
+                self._l_forwards.clear()
+                self._r_forwards.clear()
             self._stop_keepalive()
 
             if _use_multiplexing and self._socket:
@@ -571,6 +619,8 @@ class SSHConnection:
                     self._stop_forward_process(forward)
             self._r_forwards.clear()
             self.disconnect()
+        for forward in tuple(self._forward_processes):
+            self._stop_forward_process(forward)
         shutil.rmtree(self._tmpdir)
 
 sshmanager = SSHConnectionManager()

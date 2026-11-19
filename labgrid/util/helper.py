@@ -1,9 +1,12 @@
 import errno
+import getpass
 import logging
 import os
+import queue
 import re
 import select
 import subprocess
+import threading
 from contextlib import closing
 from socket import AF_INET, SOCK_STREAM, socket
 
@@ -18,7 +21,6 @@ try:
 except ImportError:
     # pty is not available, presumably as we're on Microsoft Windows
     pty = None
-    import winpty
 
 import attr
 
@@ -39,8 +41,7 @@ def get_user():
     user = os.environ.get("USER")
     if user:
         return user
-    import pwd
-    return pwd.getpwuid(os.getuid())[0]
+    return getpass.getuser()
 
 def set_nonblocking(fd):
     if fcntl is not None:
@@ -67,8 +68,8 @@ class ProcessWrapper:
         logger = logging.getLogger("Process")
 
         if pty is None:
-            return self._check_output_winpty(
-                command, logger, print_on_silent_log, input, stdin)
+            return self._check_output_windows(
+                command, logger, print_on_silent_log, input, stdin, stderr, timeout)
 
         res = []
         mfd, sfd = pty.openpty()
@@ -189,58 +190,91 @@ class ProcessWrapper:
         # of the normal subprocess module
         return b'\n'.join([r.strip(b'\n') for r in res])
 
-    def _check_output_winpty(self, command, logger, print_on_silent_log, input, stdin):
-        terminal = winpty.PTY(80, 40)
-        cmdline = subprocess.list2cmdline(command[1:])
-        terminal.spawn(command[0], cmdline=cmdline)
-        logger.log(ProcessWrapper.loglevel, "[%d] command: %s", terminal.pid, " ".join(command))
+    def _check_output_windows(self, command, logger, print_on_silent_log, input, stdin,
+                              stderr, timeout):
+        if input is not None and stdin is not None:
+            raise ValueError("stdin and input cannot both be supplied")
+        if input is not None and not isinstance(input, (bytes, bytearray, memoryview)):
+            raise TypeError("input must be bytes-like")
+        deadline = Timeout(float(timeout)) if timeout is not None else None
+        with subprocess.Popen(
+            command, stdin=subprocess.PIPE if input is not None else stdin,
+            stdout=subprocess.PIPE, stderr=stderr,
+        ) as process:
+            logger.log(self.loglevel, "[%d] command: %s", process.pid, " ".join(command))
+            events = queue.Queue()
 
-        if ProcessWrapper.print_callback in self.callbacks:
-            print_on_silent_log = False
-        if print_on_silent_log and logger.getEffectiveLevel() > ProcessWrapper.loglevel:
-            self.enable_print()
+            def read_output():
+                try:
+                    while data := process.stdout.read1(65536):
+                        events.put(data)
+                except OSError as error:
+                    events.put(error)
+                finally:
+                    events.put(None)
 
-        class ProcessInfo:
-            pid = terminal.pid
+            def write_input():
+                try:
+                    with process.stdin:
+                        process.stdin.write(input)
+                except BrokenPipeError:
+                    pass
+                except OSError as error:
+                    events.put(error)
 
-        process = ProcessInfo()
-        result = []
-        buf = b""
-        pending_input = input.decode("utf-8", errors="replace") if input else ""
-
-        while terminal.isalive():
-            if pending_input:
-                written = terminal.write(pending_input)
-                pending_input = pending_input[written:]
-            raw = terminal.read(blocking=False)
-            if raw:
-                data = raw.encode("utf-8", errors="replace")
-                *parts, buf = (buf + data).split(b"\r")
-                result.extend(parts)
-                for part in parts:
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            writer = None
+            if input is not None:
+                writer = threading.Thread(target=write_input, daemon=True)
+                writer.start()
+            show_output = (
+                print_on_silent_log
+                and self.print_callback not in self.callbacks
+                and logger.getEffectiveLevel() > self.loglevel
+            )
+            if show_output:
+                self.enable_print()
+            result = []
+            buf = b""
+            try:
+                while True:
+                    if deadline is not None and deadline.expired:
+                        raise TimeoutError(f"Timeout of {timeout} seconds exceeded: {command}")
+                    try:
+                        data = events.get(timeout=0.05)
+                    except queue.Empty:
+                        continue
+                    if data is None:
+                        break
+                    if isinstance(data, OSError):
+                        raise data
+                    result.append(data)
+                    *lines, buf = (buf + data).split(b"\n")
+                    for line in lines:
+                        for callback in self.callbacks:
+                            callback(line.rstrip(b"\r"), process)
+                remaining = deadline.remaining if deadline is not None else None
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired as error:
+                    raise TimeoutError(f"Timeout of {timeout} seconds exceeded: {command}") from error
+                if buf:
                     for callback in self.callbacks:
-                        callback(part, process)
-            else:
-                time.sleep(0.01)
-
-        raw = terminal.read(blocking=False)
-        if raw:
-            *parts, buf = (buf + raw.encode("utf-8", errors="replace")).split(b"\r")
-            result.extend(parts)
-        status = terminal.get_exitstatus()
-        process.returncode = status
-        if buf:
-            result.append(buf)
-            final = buf if buf.endswith(b"\n") else buf + b"\n"
-            for callback in self.callbacks:
-                callback(final, process)
-        if print_on_silent_log and logger.getEffectiveLevel() > ProcessWrapper.loglevel:
-            self.disable_print()
-
-        result = b"\n".join(line.strip(b"\n") for line in result)
-        if status != 0:
-            raise subprocess.CalledProcessError(status, command, output=result)
-        return result
+                        callback(buf, process)
+                output = b"".join(result).replace(b"\r\n", b"\n")
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, command, output=output)
+                return output
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                reader.join()
+                if writer is not None:
+                    writer.join()
+                if show_output:
+                    self.disable_print()
 
     def register(self, callback):
         """Register a callback with the ProcessWrapper"""

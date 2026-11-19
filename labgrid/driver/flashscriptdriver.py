@@ -1,8 +1,13 @@
+import os
+import shlex
+
 import attr
 
 from ..factory import target_factory
 from ..step import step
 from ..util.managedfile import ManagedFile
+from ..resource.common import NetworkResource
+from ..util.ssh import sshmanager
 from .common import Driver
 
 from ..util.helper import processwrapper
@@ -50,6 +55,11 @@ class FlashScriptDriver(Driver):
 
         mf = ManagedFile(script, self.device)
         mf.sync_to_resource()
+
+        if os.name == "nt" and isinstance(self.device, NetworkResource):
+            sshmanager.get(self.device.host).run_check(
+                f"chmod u+x {shlex.quote(mf.get_remote_path())}"
+            )
 
         cmd = [mf.get_remote_path()] + [a.format(device=self.device, file=mf) for a in args]
 
